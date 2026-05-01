@@ -1,0 +1,5 @@
+{
+  "name": "prbe-codex-tap-plugin",
+  "description": "Codex CLI plugin: ships per-session transcripts to Probe for ingestion",
+  "version": "0.1.0"
+}
