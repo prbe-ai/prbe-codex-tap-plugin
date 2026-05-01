@@ -9,8 +9,15 @@
     {
       "name": "prbe-codex-tap-plugin",
       "description": "Ships per-session Codex transcripts to Probe for ingestion. Every Codex session you start gets indexed into your team's operational memory automatically.",
-      "source": "./plugins/prbe-codex-tap-plugin",
-      "category": "productivity",
+      "source": {
+        "source": "local",
+        "path": "./plugins/prbe-codex-tap-plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Productivity",
       "tags": ["probe", "ingestion", "transcripts", "knowledge"],
       "homepage": "https://prbe.ai"
     }
