@@ -16,15 +16,16 @@ Translation rules:
   session_meta    → synthetic CC `system` event, subtype=session_start
                     extras: cli_version, originator, model_provider, source,
                             forked_from_id, agent_role, agent_nickname,
-                            agent_path, dynamic_tools, memory_mode, base_instructions
+                            agent_path, dynamic_tools, memory_mode
   turn_context    → synthetic CC `system` event, subtype=turn_context
                     extras: full TurnContextItem (sandbox_policy, network,
-                            personality, developer/user_instructions, …)
+                            personality, …)
   compacted       → synthetic CC `system` event, subtype=compaction
                     extras: replacement_history
-  response_item.message     → CC `user`/`assistant` (or `user` for developer)
+  response_item.message     → CC `user`/`assistant`
                               with content[] of {type: text, text} blocks
-                              extras: phase, original role if developer
+                              extras: phase
+                              drops: startup context / developer instruction frames
   response_item.reasoning   → CC `assistant` event with
                               {type: thinking, thinking: <flattened text>}
                               extras: structured reasoning_summary
@@ -75,7 +76,7 @@ _DROP_EVENT_MSG_TYPES: frozenset[str] = frozenset({
 _SESSION_META_EXTRAS: tuple[str, ...] = (
     "cli_version", "originator", "model_provider", "source", "forked_from_id",
     "agent_role", "agent_nickname", "agent_path", "dynamic_tools",
-    "memory_mode", "base_instructions", "git", "timestamp",
+    "memory_mode", "git", "timestamp",
 )
 
 # TurnContextItem fields that go into _codex_extras. cwd / model can change
@@ -84,9 +85,15 @@ _TURN_CONTEXT_EXTRAS: tuple[str, ...] = (
     "turn_id", "trace_id", "cwd", "current_date", "timezone",
     "approval_policy", "sandbox_policy", "permission_profile", "network",
     "file_system_sandbox_policy", "model", "personality",
-    "collaboration_mode", "realtime_active", "effort", "summary",
-    "user_instructions", "developer_instructions", "final_output_json_schema",
-    "truncation_policy",
+    "realtime_active", "effort",
+    "final_output_json_schema", "truncation_policy",
+)
+
+_STARTUP_CONTEXT_TAGS: tuple[str, ...] = (
+    "permissions instructions",
+    "skills_instructions",
+    "plugins_instructions",
+    "environment_context",
 )
 
 # Tool input summary keys ordered by "most identifying". Mirrors cc-tap.
@@ -193,18 +200,23 @@ def _translate_response_item(payload: dict, timestamp: Any) -> Any:
     )
 
 
-def _translate_message(payload: dict, timestamp: Any) -> dict:
+def _translate_message(payload: dict, timestamp: Any) -> dict | None:
     role = payload.get("role") or "user"
+    if role == "developer":
+        return None
+    if role == "user" and _is_startup_context_message(payload):
+        return None
+
     cc_role = "assistant" if role == "assistant" else "user"
     blocks = [_translate_content_item(c) for c in payload.get("content") or []]
     blocks = [b for b in blocks if b is not None]
+    if not blocks:
+        return None
 
     extras: dict[str, Any] = {}
     phase = payload.get("phase")
     if phase in _PHASES:
         extras["phase"] = phase
-    if role == "developer":
-        extras["original_role"] = "developer"
 
     out: dict[str, Any] = {
         "type": cc_role,
@@ -214,6 +226,34 @@ def _translate_message(payload: dict, timestamp: Any) -> dict:
     if extras:
         out["_codex_extras"] = extras
     return out
+
+
+def _is_startup_context_message(payload: dict) -> bool:
+    texts = _content_texts(payload.get("content"))
+    return bool(texts) and all(_is_startup_context_text(t) for t in texts)
+
+
+def _content_texts(content: Any) -> list[str]:
+    if not isinstance(content, list):
+        return []
+    texts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in ("input_text", "output_text"):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text:
+            texts.append(text)
+    return texts
+
+
+def _is_startup_context_text(text: str) -> bool:
+    stripped = text.strip().lower()
+    return any(
+        stripped.startswith(f"<{tag}>") and stripped.endswith(f"</{tag}>")
+        for tag in _STARTUP_CONTEXT_TAGS
+    )
 
 
 def _translate_content_item(item: Any) -> dict | None:

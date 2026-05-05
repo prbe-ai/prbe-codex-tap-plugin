@@ -18,8 +18,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from tap.outbox import build_batch_body
 from tap.sanitize import sanitize_event
 
@@ -50,7 +48,7 @@ def test_session_meta_becomes_system_event_with_extras():
     assert extras["cli_version"] == "0.128.0"
     assert extras["originator"] == "codex_cli"
     assert extras["source"] == "startup"
-    assert "base_instructions" in extras
+    assert "base_instructions" not in extras
     # session_id flows separately at envelope level — should NOT be in extras.
     assert "id" not in extras
 
@@ -67,7 +65,7 @@ def test_turn_context_becomes_system_event_carrying_full_config():
             "sandbox_policy": "read-only",
             "personality": "default",
             "developer_instructions": "be concise",
-            "user_instructions": None,
+            "user_instructions": "project instructions",
         },
     }
     out = sanitize_event(raw)
@@ -76,7 +74,8 @@ def test_turn_context_becomes_system_event_carrying_full_config():
     extras = out["_codex_extras"]
     assert extras["sandbox_policy"] == "read-only"
     assert extras["model"] == "gpt-5.5"
-    assert extras["developer_instructions"] == "be concise"
+    assert "developer_instructions" not in extras
+    assert "user_instructions" not in extras
 
 
 def test_response_message_assistant_text_round_trips():
@@ -115,7 +114,7 @@ def test_response_message_user_no_phase_no_extras():
     assert "_codex_extras" not in out
 
 
-def test_developer_role_folds_into_user_with_extras_flag():
+def test_developer_role_message_is_dropped():
     raw = {
         "type": "response_item",
         "timestamp": "t",
@@ -125,9 +124,41 @@ def test_developer_role_folds_into_user_with_extras_flag():
             "content": [{"type": "input_text", "text": "system instructions go here"}],
         },
     }
+    assert sanitize_event(raw) is None
+
+
+def test_user_startup_context_message_is_dropped():
+    raw = {
+        "type": "response_item",
+        "timestamp": "t",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>",
+            }],
+        },
+    }
+    assert sanitize_event(raw) is None
+
+
+def test_real_user_message_with_context_words_survives():
+    raw = {
+        "type": "response_item",
+        "timestamp": "t",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": "why is <environment_context> showing up in search?",
+            }],
+        },
+    }
     out = sanitize_event(raw)
     assert out["type"] == "user"
-    assert out["_codex_extras"] == {"original_role": "developer"}
+    assert out["message"]["content"][0]["text"].startswith("why is")
 
 
 def test_function_call_becomes_tool_use_with_summary():
@@ -309,7 +340,7 @@ def test_fixture_assistant_final_answer_survives():
     assert blocks == [{"type": "text", "text": "Hello, hope you are well."}]
 
 
-def test_fixture_drops_event_msgs_and_keeps_response_items_and_meta():
+def test_fixture_drops_event_msgs_and_startup_preamble():
     sanitized = [sanitize_event(line) for line in _read_fixture()]
     kept = [s for s in sanitized if s is not None]
     raw = _read_fixture()
@@ -327,8 +358,30 @@ def test_fixture_drops_event_msgs_and_keeps_response_items_and_meta():
         if r["type"] == "response_item" and r["payload"].get("type") == "reasoning"
         and not r["payload"].get("content")
     )
+    n_startup_messages = sum(
+        1 for r in raw
+        if r["type"] == "response_item"
+        and r["payload"].get("type") == "message"
+        and r["payload"].get("role") in ("developer", "user")
+        and (
+            r["payload"].get("role") == "developer"
+            or all(
+                isinstance(c, dict)
+                and isinstance(c.get("text"), str)
+                and c["text"].strip().startswith("<environment_context>")
+                for c in (r["payload"].get("content") or [])
+            )
+        )
+    )
     expected_kept -= n_reasoning
+    expected_kept -= n_startup_messages
     assert len(kept) == expected_kept
+    serialized = json.dumps(kept)
+    assert "permissions instructions" not in serialized
+    assert "skills_instructions" not in serialized
+    assert "environment_context" not in serialized
+    assert "base_instructions" not in serialized
+    assert "developer_instructions" not in serialized
     # Sanity check: nothing from event_msg survived.
     assert n_event_msg > 0  # fixture sanity
     assert all(s.get("subtype", "").startswith(("session_start", "turn_context"))
@@ -367,6 +420,40 @@ def test_build_batch_body_drops_only_lines_that_sanitize_to_none():
     body = build_batch_body(
         device_id="d", session_id="s", batch_seq=0, cwd="/r",
         base_line_no=0, lines=drop_only,
+    )
+    assert body is None
+
+
+def test_build_batch_body_drops_startup_preamble_messages():
+    preamble_only = [
+        json.dumps({
+            "type": "response_item",
+            "timestamp": "t",
+            "payload": {
+                "type": "message",
+                "role": "developer",
+                "content": [{
+                    "type": "input_text",
+                    "text": "<permissions instructions>\nno tools\n</permissions instructions>",
+                }],
+            },
+        }).encode(),
+        json.dumps({
+            "type": "response_item",
+            "timestamp": "t",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>",
+                }],
+            },
+        }).encode(),
+    ]
+    body = build_batch_body(
+        device_id="d", session_id="s", batch_seq=0, cwd="/r",
+        base_line_no=0, lines=preamble_only,
     )
     assert body is None
 
